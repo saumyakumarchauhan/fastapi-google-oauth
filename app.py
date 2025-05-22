@@ -1,80 +1,64 @@
 import os
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import RedirectResponse
+from starlette.config import Config
 from starlette.middleware.sessions import SessionMiddleware
-from authlib.integrations.starlette_client import OAuth
+from google.oauth2 import id_token
+from google.auth.transport import requests as grequests
+import requests
+from urllib.parse import urlencode
 
-# Load environment variables from .env
-load_dotenv()
+config = Config(".env")
+CLIENT_ID = config("CLIENT_ID")
+CLIENT_SECRET = config("CLIENT_SECRET")
+REDIRECT_URI = config("REDIRECT_URI")
 
 app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key="your-secret-session-key")
 
-# Add session middleware - needed to store session data like tokens
-app.add_middleware(SessionMiddleware, secret_key="super-secret-session-key")
-
-# Configure OAuth for Google with client ID and secret from env
-oauth = OAuth()
-oauth.register(
-    name="google",
-    client_id=os.getenv("GOOGLE_CLIENT_ID"),
-    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
-    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-    client_kwargs={"scope": "openid email profile"},
-)
-
-# Allowed user email for access (replace with your email)
-ALLOWED_EMAIL = "24f1000666@ds.study.iitm.ac.in"
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
 @app.get("/")
-async def login(request: Request):
-    user = request.session.get("user")
-    id_token = request.session.get("id_token")
+def login():
+    query_params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",
+        "prompt": "consent"
+    }
+    auth_url = f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(query_params)}"
+    return RedirectResponse(auth_url)
 
-    # If user is already authenticated and email matches
-    if user:
-        if user.get("email") == ALLOWED_EMAIL:
+@app.get("/auth")
+async def auth(request: Request, code: str = None):
+    if not code:
+        return {"error": "No code provided"}
+
+    # Exchange code for token
+    token_data = {
+        "code": code,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }
+
+    response = requests.post(GOOGLE_TOKEN_ENDPOINT, data=token_data)
+    token_json = response.json()
+
+    id_token_str = token_json.get("id_token")
+
+    if id_token_str:
+        try:
+            id_info = id_token.verify_oauth2_token(id_token_str, grequests.Request(), CLIENT_ID)
             return {
-                "message": f"Hello {user['email']}, you are logged in.",
-                "id_token": id_token
+                "id_token": id_token_str,
+                "client_id": CLIENT_ID
             }
-        else:
-            # Deny access if email is not allowed
-            raise HTTPException(status_code=403, detail="Access forbidden: unauthorized user")
+        except ValueError:
+            return {"error": "Invalid ID Token"}
 
-    # Handle OAuth callback with code from Google
-    if "code" in request.query_params:
-        # Exchange the code for token
-        token = await oauth.google.authorize_access_token(request)
-        userinfo = token.get("userinfo")
-        id_token = token.get("id_token")
-
-        # Check user info and email verification
-        if userinfo and userinfo.get("email_verified") and userinfo.get("email") == ALLOWED_EMAIL:
-            # Save user info and id_token in session
-            request.session["user"] = userinfo
-            request.session["id_token"] = id_token
-            return RedirectResponse("/")
-        else:
-            raise HTTPException(status_code=403, detail="Email not verified or unauthorized")
-
-    # Not logged in, redirect user to Google login page
-    redirect_uri = request.url._url  # Current URL for redirect after login
-    return await oauth.google.authorize_redirect(request, redirect_uri)
-
-# Endpoint to get raw id_token as JSON
-@app.get("/id_token")
-async def get_id_token(request: Request):
-    id_token = request.session.get("id_token")
-    user = request.session.get("user")
-
-    if not user or not id_token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    if user.get("email") != ALLOWED_EMAIL:
-        raise HTTPException(status_code=403, detail="Unauthorized user")
-
-    return JSONResponse(content={"id_token": id_token})
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, port=8000)
+    return {"error": "Failed to retrieve ID token"}
